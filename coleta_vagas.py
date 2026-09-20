@@ -21,12 +21,20 @@
    5) Limpeza: remocao de duplicatas e tratamento de campos ausentes
    6) Gravacao em arquivo estruturado (CSV e JSON)
 
+ CODIGOS DE SAIDA
+   0 = coleta concluida e arquivos gravados
+   1 = robots.txt proibe coletar a area pedida
+   2 = robots.txt inacessivel (sem poder ler as regras, nao se coleta)
+   3 = falha ao gravar os arquivos de saida
+   4 = nenhuma vaga coletada (os arquivos anteriores NAO foram atualizados)
+
  OBS.: nenhuma API e consumida - toda a coleta e feita sobre o HTML das paginas.
 ===============================================================================
 """
 
 import csv
 import json
+import os
 import re
 import sys
 import time
@@ -179,11 +187,20 @@ def normalizar_contrato(bruto):
     return CONTRATOS_CANONICOS.get(chave, bruto)
 
 
-def baixar_pagina(url, tentativas=MAX_TENTATIVAS):
+def baixar_pagina(url, tentativas=MAX_TENTATIVAS, com_motivo=False):
     """
     Faz GET com requests, tratando timeouts, erros de rede e status != 200.
     Retorna o HTML (str) ou None - nunca levanta excecao para quem chama.
+
+    Com com_motivo=True devolve (html, motivo), em que motivo e:
+      "ok"      - baixado com sucesso;
+      "ausente" - o servidor respondeu 404/410, o recurso nao existe;
+      "falha"   - erro de rede, timeout ou erro do servidor (5xx).
+    A distincao importa para o robots.txt: "ausente" significa que o portal
+    nao publica regras (coleta liberada), enquanto "falha" significa que nao
+    foi possivel saber o que ele permite - casos opostos, nao equivalentes.
     """
+    motivo = "falha"
     for tentativa in range(1, tentativas + 1):
         try:
             resposta = sessao.get(url, timeout=TIMEOUT)
@@ -194,12 +211,17 @@ def baixar_pagina(url, tentativas=MAX_TENTATIVAS):
                 tipo = resposta.headers.get("Content-Type", "").lower()
                 if resposta.encoding is None or "charset" not in tipo:
                     resposta.encoding = resposta.apparent_encoding or "utf-8"
-                return resposta.text
+                return (resposta.text, "ok") if com_motivo else resposta.text
+            if resposta.status_code in (404, 410):
+                # Repetir um 404 nao muda nada: sai do laco na hora.
+                log(f"  ! HTTP {resposta.status_code} em {url} (nao existe)")
+                motivo = "ausente"
+                break
             log(f"  ! HTTP {resposta.status_code} em {url}")
         except requests.exceptions.RequestException as erro:
             log(f"  ! Falha ({tentativa}/{tentativas}) em {url}: {type(erro).__name__}")
         time.sleep(ESPERA * tentativa)
-    return None
+    return (None, motivo) if com_motivo else None
 
 
 # ============================================================================
@@ -215,11 +237,22 @@ def verificar_robots_e_sitemap():
     parser = RobotFileParser()
     parser.set_url(urljoin(BASE_URL, "/robots.txt"))
 
-    texto_robots = baixar_pagina(urljoin(BASE_URL, "/robots.txt"))
+    texto_robots, motivo = baixar_pagina(urljoin(BASE_URL, "/robots.txt"),
+                                         com_motivo=True)
     if texto_robots is None:
-        log("  robots.txt nao encontrado/inacessivel -> assumindo coleta permitida")
-        parser.parse([])
-        return parser
+        if motivo == "ausente":
+            # 404: o portal nao publica robots.txt, o que pela RFC 9309
+            # significa que nao ha restricao declarada.
+            log("  robots.txt nao existe (HTTP 404) -> coleta permitida")
+            parser.parse([])
+            return parser
+        # Erro de rede ou do servidor: NAO da para saber o que o portal
+        # permite. Antes o codigo seguia como se tudo fosse liberado - um
+        # "fail open" que contraria a RFC 9309 e o requisito 1 do trabalho,
+        # que e justamente respeitar o robots.txt.
+        log("  ! robots.txt INACESSIVEL (erro de rede ou do servidor).")
+        log("    Sem conseguir ler as regras, a coleta nao pode continuar.")
+        sys.exit(2)
 
     if salvar_texto(ARQ_ROBOTS, texto_robots):
         log(f"  robots.txt salvo em '{ARQ_ROBOTS}' ({len(texto_robots)} caracteres)")
@@ -317,19 +350,30 @@ def buscar_com_selenium(termo=TERMO_BUSCA):
         link = espera.until(EC.presence_of_element_located(
             (By.XPATH, f"//a[normalize-space(text())='{termo}']")))
         destino = link.get_attribute("href")
+        # A referencia e a URL REALMENTE aberta agora, nao a constante
+        # URL_LISTAGEM: se o portal redirecionasse /jobs para outro endereco,
+        # a espera abaixo terminaria de imediato, antes mesmo do clique.
+        url_antes = driver.current_url
         driver.execute_script("arguments[0].click();", link)
 
         # Esperar a navegacao de verdade. Com time.sleep() fixo, um clique
-        # lento deixava current_url ainda em /jobs e a coleta seguia nas vagas
-        # GENERICAS, sem erro nenhum. O "or destino" nao protegia: current_url
-        # e uma string nao-vazia mesmo quando nada navegou.
+        # lento deixava a URL ainda na listagem e a coleta seguia nas vagas
+        # GENERICAS, sem erro nenhum.
         try:
-            espera.until(EC.url_changes(URL_LISTAGEM))
+            espera.until(EC.url_changes(url_antes))
         except Exception:                          # noqa: BLE001
             log("  A URL nao mudou apos o clique - usando o href do proprio link")
 
         url_resultados = driver.current_url
-        if url_resultados.rstrip("/") == URL_LISTAGEM.rstrip("/"):
+
+        # Conferir que a navegacao chegou ao resultado esperado. Sem isto,
+        # qualquer pagina que nao seja a de origem passaria por valida.
+        if not url_resultados or url_resultados.rstrip("/") == url_antes.rstrip("/"):
+            url_resultados = destino
+        elif destino and (urlparse(url_resultados).path.rstrip("/")
+                          != urlparse(destino).path.rstrip("/")):
+            log(f"  URL inesperada apos o clique ({url_resultados})"
+                " - usando o href do link")
             url_resultados = destino
         if not url_resultados:
             return None
@@ -555,9 +599,24 @@ def extrair_tecnologias(soup):
     """
     Tags de tecnologia da vaga: links cujo href comeca com '/jobs-'.
     Exclui '/jobs-city/...' (localidade) e os links do rodape ('Vagas programador X').
+
+    A varredura para no fim do anuncio, como fazem os demais campos. Hoje o
+    rodape so traz links com o texto "Vagas programador X", barrados pelo
+    filtro de texto abaixo - mas esse filtro depende de uma frase do site: se
+    ela mudasse, os 13 links do rodape entrariam como tecnologia em TODAS as
+    linhas. Delimitar por posicao e a defesa que nao depende do texto.
     """
+    # Uma passada pela arvore: posicao de cada no e onde o anuncio termina.
+    posicao, limite = {}, None
+    for indice, no in enumerate(soup.descendants):
+        posicao[id(no)] = indice
+        if limite is None and isinstance(no, NavigableString) and RE_FIM_VAGA.search(no):
+            limite = indice
+
     tecnologias = []
     for ancora in soup.select("a[href^='/jobs-']"):
+        if limite is not None and posicao.get(id(ancora), limite) >= limite:
+            break                       # dali para baixo e rodape/vagas similares
         href = ancora.get("href", "")
         texto = ancora.get_text(" ", strip=True)
         if href.startswith("/jobs-city") or not texto:
@@ -702,8 +761,17 @@ def remover_duplicatas(registros):
 def tratar_e_salvar(registros):
     log("ETAPA 5 - Tratando os dados (duplicatas e campos ausentes)")
     if not registros:
-        log("  Nenhum registro coletado - nada a salvar.")
-        return
+        # Nao sobrescrever os arquivos: os dados da execucao anterior podem
+        # ser bons. Mas deixar claro, aqui e no codigo de saida, que eles NAO
+        # sao o resultado desta execucao.
+        log("  ! NENHUMA vaga foi coletada nesta execucao.")
+        log(f"    '{ARQ_CSV}' e '{ARQ_JSON}' NAO foram atualizados.")
+        for arquivo in (ARQ_CSV, ARQ_JSON):
+            if os.path.exists(arquivo):
+                quando = datetime.fromtimestamp(os.path.getmtime(arquivo))
+                log(f"    '{arquivo}' ainda contem os dados de {quando:%d/%m/%Y %H:%M}")
+        log("    Nao interprete esses arquivos como resultado de agora.")
+        return False
 
     unicos = remover_duplicatas(registros)
     log(f"  {len(registros)} registros -> {len(unicos)} apos remocao de duplicatas")
@@ -727,9 +795,10 @@ def tratar_e_salvar(registros):
         # Caso classico: o CSV da execucao anterior aberto no Excel.
         log(f"  ! Falha ao gravar os arquivos: {type(erro).__name__}: {erro}")
         log("    Feche o CSV/JSON se estiverem abertos e rode novamente.")
-        return
+        return False
 
     log(f"ETAPA 6 - Arquivos gerados: '{ARQ_CSV}' e '{ARQ_JSON}' ({len(unicos)} vagas)")
+    return True
 
 
 # ============================================================================
@@ -768,9 +837,16 @@ def main():
             log(f"  [{i}/{len(links)}] {vaga['titulo'][:55]}")
         time.sleep(ESPERA)
 
-    tratar_e_salvar(registros)
+    gravou = tratar_e_salvar(registros)
     print("=" * 79)
+
+    # Codigo de saida != 0 quando nada foi produzido: sem isto o processo
+    # terminava como sucesso mesmo sem ter gravado nada, e quem automatizasse
+    # a execucao trataria a falha como conclusao normal.
+    if not registros:
+        return 4
+    return 0 if gravou else 3
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
