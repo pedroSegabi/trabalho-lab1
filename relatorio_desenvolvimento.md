@@ -1,119 +1,96 @@
 # Relatório de Desenvolvimento — Laboratório 1: Web Scraping
 
-**Portal escolhido:** ProgramaThor (`https://programathor.com.br`)
-**Área/cargo pesquisado:** vagas de desenvolvimento em **Python**
-**Arquivos entregues:** `coleta_vagas.py` (código-fonte), `vagas_programathor.csv` / `vagas_programathor.json` (dados), este relatório.
+**Portal:** ProgramaThor (`https://programathor.com.br`) · **Área:** vagas de desenvolvimento em **Python**
+**Entregues:** `coleta_vagas.py`, `vagas_programathor.csv` / `.json`, `robots_programathor.txt`, `sitemap_programathor.txt`, este relatório.
 
----
+## 1. Decisões iniciais
 
-## 1. Escolha do portal e decisões iniciais
-
-O ProgramaThor foi escolhido por três motivos práticos. Primeiro, as páginas de listagem e de detalhe são **renderizadas no servidor**: o HTML já chega completo, o que permite usar `requests` + BeautifulSoup sem depender de JavaScript. Segundo, a **paginação é por URL** (`/jobs-python?page=2`, `/jobs-python?page=3`…), com link *Next ›* explícito no HTML, o que torna a navegação além da primeira tela simples e verificável. Terceiro, a **faixa salarial é opcional** no anúncio — a maior parte das vagas não a divulga —, o que exercita exatamente o requisito de tratar campos ausentes sem gerar exceção.
-
-Foram descartados portais como Catho, InfoJobs e LinkedIn por exigirem login, usarem carregamento dinâmico agressivo ou bloquearem robôs em `robots.txt`.
-
-Decidiu-se coletar em **duas camadas**: a listagem fornece apenas os links das vagas; os campos (título, empresa, local, salário, requisitos) são extraídos da **página individual de cada vaga**, que é mais completa e estável que o card resumido da listagem.
+O ProgramaThor foi escolhido porque as páginas são renderizadas no servidor (o HTML chega completo), a paginação é por URL (`?page=N`) com link *Next* explícito, e a faixa salarial é opcional — o que exercita o tratamento de campos ausentes. Catho, InfoJobs e LinkedIn foram descartados por exigirem login ou bloquearem robôs. A coleta é em duas camadas: a listagem fornece só os links; os campos vêm da página individual da vaga, mais completa que o card resumido.
 
 ## 2. Robots.txt e sitemap.xml
 
-A verificação é feita pelo próprio programa, na Etapa 1, **antes de qualquer coleta** (função `verificar_robots_e_sitemap()`). O script baixa `https://programathor.com.br/robots.txt`, grava o conteúdo em `robots_programathor.txt`, extrai por regex todas as regras `Disallow:` e todas as declarações `Sitemap:`, e carrega as regras em um `RobotFileParser` (`urllib.robotparser`). Em seguida baixa o sitemap declarado (ou tenta o caminho padrão `/sitemap.xml`), trata o caso de **índice de sitemaps** (`<sitemapindex>`, que aponta para sub-sitemaps) e salva todas as URLs encontradas em `sitemap_programathor.txt`.
-
-Antes de baixar a listagem, o programa chama `can_fetch()` para o caminho `/jobs` e **aborta a execução** se a coleta não for permitida; o mesmo teste é repetido individualmente para cada URL de vaga dentro do laço principal.
-
-**Resultado da verificação.** O arquivo `robots.txt` do portal é curto e permissivo:
+A verificação é feita pelo programa antes de qualquer coleta (`verificar_robots_e_sitemap()`): baixa `/robots.txt`, salva em disco, extrai por regex as regras `Disallow:` e as declarações `Sitemap:` e carrega tudo num `RobotFileParser`. O arquivo é curto e permissivo:
 
 ```
 Sitemap: https://programathor.com.br/sitemap.xml
-User-agent: *
-Disallow: /admin/
-Disallow: /user/
-Disallow: /users/
-Disallow: /company/
+User-agent: *      Disallow: /admin/   /user/   /users/   /company/
 ```
 
-A regra `User-agent: *` vale para todos os robôs e há quatro diretórios bloqueados, todos ligados a áreas privadas: painel administrativo (`/admin/`), páginas de cadastro e perfil de candidatos (`/user/`, `/users/`) e área restrita de empresas (`/company/`). Não existe nenhuma regra `Allow`, e — o que importa para este trabalho — **nenhum bloqueio incide sobre `/jobs`**, que é justamente onde ficam a listagem e as páginas individuais das vagas. A coleta realizada está, portanto, integralmente dentro do que o portal autoriza, o que foi confirmado em tempo de execução: `can_fetch('/jobs')` retornou `True`.
+`User-agent: *` vale para todos os robôs e os quatro bloqueios são de áreas privadas (painel administrativo, perfil de candidatos, área restrita de empresas). Não há regra `Allow` e **nenhum bloqueio incide sobre `/jobs`**, onde ficam a listagem e as vagas: `can_fetch('/jobs')` retornou `True`. O programa consulta `can_fetch()` três vezes — para `/jobs` antes de o Selenium abrir a listagem, para a URL de resultados e para cada vaga no laço principal — e aborta se a permissão for negada; se o `robots.txt` estiver inacessível por erro de rede, também aborta, pois sem ler as regras não se coleta. O bloqueio é de `/company/` (singular) e os perfis públicos usam `/companies/` (plural), mas o script não visita esses perfis: lê o nome da empresa na âncora da própria vaga. O sitemap é declarado no `robots.txt` (*Sitemap Autodiscovery*) e o script segue essa declaração em vez de adivinhar o caminho padrão, tratando também o caso de índice (`<sitemapindex>`). Boas práticas: `User-Agent` identificado com o sufixo `(projeto-academico-web-scraping)`, 1,5 s entre requisições, `timeout` de 20 s e até 3 tentativas por página.
 
-Vale registrar uma distinção que só aparece na leitura atenta do arquivo: o bloqueio é de `/company/`, no singular, enquanto os links para o perfil público das empresas usam `/companies/`, no plural. Ainda assim, o script não visita esses perfis — apenas lê o nome da empresa a partir do texto da âncora presente na própria página da vaga —, de modo que a questão não chega a se colocar.
-
-Ainda sobre `/companies/`: o cabeçalho de todas as páginas do portal contém `/companies/sign_in` e `/companies/sign_up`, cujo texto é "Como empresa". Um seletor ingênuo por `a[href*='/companies/']` captura esse link de login antes do perfil real e grava "Como empresa" como nome do anunciante em **todas** as linhas — foi exatamente o que aconteceu na primeira versão do script. A extração passou então a exigir que o `href` case com `/companies/<id numérico>`, o que descarta as páginas de autenticação e recupera o nome correto.
-
-O `robots.txt` também declara explicitamente o sitemap em `https://programathor.com.br/sitemap.xml`, exatamente o mecanismo de *Sitemap Autodiscovery* discutido em aula: o robô descobre o mapa do site sem precisar adivinhar o caminho. O script segue essa declaração automaticamente, em vez de assumir o caminho padrão, e grava as URLs encontradas em `sitemap_programathor.txt`.
-
-Além do `robots.txt`, adotaram-se as boas práticas discutidas em aula: `User-Agent` de navegador acrescido do sufixo `(projeto-academico-web-scraping)`, que identifica a origem da coleta, intervalo de 1,5 s entre requisições, `timeout` de 20 s e no máximo 3 tentativas por página. Registre-se que o `RobotFileParser` compara apenas o token anterior à primeira barra desse cabeçalho (`mozilla`); como a única regra do portal é `User-agent: *`, a verificação vale igualmente para qualquer robô. Nenhum dado pessoal de candidatos é coletado — apenas informações públicas do anúncio —, o que mantém a coleta fora do escopo sensível da LGPD.
-
-## 3. Ferramentas e bibliotecas por etapa
+## 3. Ferramentas por etapa
 
 | Etapa | Ferramenta | Papel |
 |---|---|---|
-| Verificação de robots/sitemap | `requests`, `urllib.robotparser`, `re` | baixar, interpretar regras e validar permissões |
-| Busca pelo assunto | **Selenium** (Chrome headless) | abrir o site, acionar o menu de skills e clicar em "Python" |
-| Navegação pelas páginas | `requests` + BeautifulSoup | baixar cada página de resultados e achar o link "Next" |
-| Extração dos campos | BeautifulSoup (seletores CSS) + `re` | localizar título, empresa, local, salário, requisitos |
-| Limpeza e deduplicação | `pandas` | `drop_duplicates`, `fillna`, contagem de campos ausentes |
+| Robots e sitemap | `requests`, `urllib.robotparser`, `re` | baixar, interpretar regras, validar permissões |
+| Busca pelo assunto | **Selenium** (Chrome headless) | abrir o site, acionar o menu de skills, clicar em "Python" |
+| Navegação nas páginas | `requests` + BeautifulSoup | baixar cada página de resultados e achar o link *Next* |
+| Extração dos campos | BeautifulSoup + `re` | título, empresa, local, salário, requisitos, descrição |
+| Limpeza e deduplicação | funções próprias (`remover_duplicatas`, `limpar`) | remover repetições e padronizar campos ausentes |
 | Gravação | `pandas` / `csv` / `json` | gerar `.csv` (UTF-8 com BOM) e `.json` |
 
-A **busca é feita pelo código**, não por URL digitada à mão: o Selenium abre `/jobs`, clica no elemento "Todos os skills" para abrir o modal e clica no link cujo texto é exatamente `Python`, deixando que o próprio site conduza à página de resultados (`driver.current_url`). Se o Selenium não estiver instalado ou o layout mudar, há um *fallback* que navega diretamente para a URL de resultados — o programa registra o desvio no log e continua, em vez de quebrar.
+A busca é feita **pelo código**: o Selenium abre `/jobs`, clica em "Todos os skills" e clica no link de texto exato `Python`, deixando o site conduzir à página de resultados (`driver.current_url`). Se o Selenium falhar, o *fallback* usa a URL fixa de resultados e registra no log que a execução não cumpre o requisito da busca interativa — em vez de falhar em silêncio.
 
-## 4. Métodos de busca utilizados no código
+## 4. Métodos de busca utilizados
 
-| # | Método | O que localiza exatamente |
+| # | Método | O que localiza |
 |---|---|---|
-| 1 | XPath `//*[contains(normalize-space(text()),'Todos os skills')]` | o botão/rótulo que abre o modal com a lista completa de tecnologias |
-| 2 | XPath `//a[normalize-space(text())='Python']` | dentro do modal, a âncora cujo texto é exatamente o termo buscado (evita casar com "PyTorch", "Pyramid") |
-| 3 | CSS `a[href*='/jobs/']` | todas as âncoras cujo `href` contém `/jobs/` — candidatas a link de vaga na listagem |
-| 4 | Regex `^/jobs/\d+-[^/?#]+$` | filtra o item 3, mantendo só as URLs canônicas de vaga (`/jobs/33771-junior-fullstack-developer`) e descartando filtros (`/jobs?contract_type=PJ`), páginas (`/jobs/page/2`) e links de skill (`/jobs-python`) |
-| 5 | CSS `a[href]` + regex `[?&]page=(\d+)` no `href` **e** teste de texto (`next`, `›`, `próxima`) | o link de paginação para a página seguinte, lido do próprio HTML |
-| 6 | Regex `[?&]page=(\d+)` | remove o parâmetro de página da URL para remontar o endereço da próxima página quando o link "Next" não existe |
-| 7 | CSS `h1` | o título da vaga na página de detalhe |
-| 8 | CSS `a[href*='/companies/']` + regex `/companies/\d+` | o nome da empresa (link para o perfil corporativo, com id numérico — exclui `/companies/sign_in`) |
-| 9 | Regex `Localiza[cç][aã]o:\s*([^\n]+)` | o texto que segue o rótulo "Localização:" (cidade/modalidade) |
-| 10 | Regex `Sal[aá]rio:\s*([^\n]+)` | a faixa salarial declarada ("Até R$3.000", "Acima de R$18.000") |
-| 11 | Regex `R\$\s?\d{1,3}(?:\.\d{3})+(?:,\d{2})?` | valores monetários soltos no corpo do anúncio — usada só quando o rótulo "Salário:" traz "Não especificado". O `+` no grupo de milhar é deliberado: exigindo o separador, trechos como "R$ 50 milhões" da descrição institucional deixam de ser lidos como salário |
-| 12 | Regex `\b(CLT\|PJ\|Est[aá]gio\|Freelancer)\b` | o tipo de contrato |
-| 13 | Regex `\b(J[uú]nior\|Pleno\|S[eê]nior\|Est[aá]gio\|Trainee)\b` (com `IGNORECASE`) | o nível de senioridade (procurado primeiro no título, depois no corpo) |
-| 14 | CSS `a[href^='/jobs-']` + exclusões | as tags de tecnologia da vaga; exclui `/jobs-city/...` (localidade) e os links do rodapé, que começam com "Vagas programador…" |
-| 15 | `find_all(['h2','h3','h4','h5'])` + regex no texto do cabeçalho | os títulos das seções "Requisitos", "Atividades e Responsabilidades" e "Descrição da empresa"; o conteúdo é montado percorrendo os irmãos seguintes até o próximo cabeçalho |
-| 16 | Regex `^\s*Disallow:\s*(\S*)` e `^\s*Sitemap:\s*(\S+)` (multiline) | as regras de bloqueio e as declarações de sitemap dentro do `robots.txt` |
-| 17 | Regex `<loc>\s*(.*?)\s*</loc>` | cada URL listada no arquivo XML do sitemap |
-| 18 | Regex `\s+` | normalização de espaços, tabulações e quebras de linha em todos os campos textuais |
+| 1 | XPath `//*[contains(normalize-space(text()),'Todos os skills')]` | rótulo que abre o modal de tecnologias |
+| 2 | XPath `//a[normalize-space(text())='Python']` | âncora de texto exato no modal (não casa "PyTorch") |
+| 3 | CSS `a[href*='/jobs/']` + regex `^/jobs/\d+-[^/?#]+$` | links de vaga na listagem; o regex valida a URL canônica e descarta filtros e `/jobs-python` |
+| 4 | CSS `a[rel][href]` + regex `[?&]page=(\d+)` | link da próxima página pelo atributo `rel` (`próx`/`next`) — 1º critério |
+| 5 | CSS `a[href]` + texto (`next`, `›`, `próxima`) + mesmo regex | 2ª opção para o link da próxima página |
+| 6 | Regex `([?&])page=\d+&?` | remove `page=N` para remontar a URL quando não há link *Next* |
+| 7 | CSS `h1` | título da vaga |
+| 8 | `find_all("h3")` | 1º `<h3>`, que fecha o bloco de cabeçalho da vaga |
+| 9 | CSS `a[href*='/companies/']` + regex `/companies/\d+` | nome da empresa; o id numérico exclui `/companies/sign_in` ("Como empresa") |
+| 10 | `find_next(["h2","h3"])` | fallback da empresa: só aceita `<h2>` antes do 1º `<h3>` |
+| 11 | `find_all(["h2","h3","h4","h5"])` + regex `Requisitos\|Qualifica`, `Atividades\|Responsabilidades\|Sobre a vaga`, `Descri[cç][aã]o da empresa` | títulos das seções cujo conteúdo é extraído |
+| 12 | CSS `a[href^='/jobs-']` | tags de tecnologia (exclui `/jobs-city/` e rodapé) |
+| 13 | Regex `Localiza[cç][aã]o:\s*([^\n]+)` | cidade/modalidade após "Localização:" |
+| 14 | Regex `Sal[aá]rio:\s*([^\n]+)` | valor após "Salário:" |
+| 15 | Regex `R\$\s?\d{1,3}(?:\.\d{3})+(?:,\d{2})?` | valor em R$ no corpo; o milhar obrigatório evita ler "R$ 50 milhões" |
+| 16 | Regex `\b(CLT\|PJ\|Est[aá]gio\|Freelancer)\b` | tipo de contrato |
+| 17 | Regex `\b(J[uú]nior\|Pleno\|S[eê]nior\|Est[aá]gio\|Trainee)\b` | nível (no título, depois no cabeçalho) |
+| 18 | Regex `Veja vagas similares\|N[aã]o perca nenhuma oportunidade` | fim do anúncio — impede ler as vagas similares |
+| 19 | Regex `^\s*Disallow:\s*(\S*)` e `^\s*Sitemap:\s*(\S+)` | regras e declarações de sitemap no `robots.txt` |
+| 20 | Regex `<loc>\s*(.*?)\s*</loc>` | cada URL no XML do sitemap |
+| 21 | Regex `\s+` | normalização de espaços nos campos textuais |
 
-**Uma armadilha da paginação.** O método 5 começou testando apenas o *texto* da âncora. O problema é que o card de qualquer vaga que use a tecnologia **NextJS** contém a palavra "next" e, estando antes do rodapé no HTML, era aceito como se fosse o botão de próxima página. O efeito foi silencioso e grave: a "terceira página" coletada era, na verdade, a página de detalhe de uma vaga, de onde o script extraiu links de *vagas relacionadas* — duas delas sem qualquer relação com Python. A correção foi exigir as duas condições simultaneamente: o texto indicar avanço **e** o `href` ser de fato um link de paginação (`?page=N`). Como rede de segurança, `coletar_links()` ainda verifica se a URL obtida casa com o padrão de página de vaga e interrompe a varredura se casar, em vez de coletar dados errados.
+**Duas armadilhas corrigidas.** O método 5 testava só o *texto* da âncora, e o card de vagas com a tecnologia **NextJS** contém "next": virava "próxima página" e a 3ª página coletada era a página de uma vaga. Passou-se a exigir texto de avanço **e** href de paginação, com `rel` como 1º critério. No método 11, o conteúdo é montado percorrendo a árvore em **ordem de documento**, não pelos irmãos do título: com irmãos, a seção vazava para a seguinte quando o próximo título estava aninhado numa `<div>`, e vinha vazia quando o título estava dentro de um *wrapper*.
 
 ## 5. Tratamento dos dados
 
-**Duplicatas.** Atuam três barreiras: um `set` de URLs já vistas durante a varredura das páginas (a mesma vaga costuma reaparecer entre páginas quando a ordenação muda entre uma requisição e outra); `drop_duplicates(subset=['link'])`; e `drop_duplicates(subset=['titulo','empresa'])`, que remove republicações do mesmo anúncio com IDs diferentes — situação observada no portal, onde uma vaga chega a aparecer duas vezes na mesma página com URLs distintas.
+**Duplicatas.** Três barreiras: um `set` de URLs vistas durante a varredura e, em `remover_duplicatas()`, descarte por `link` repetido e por `titulo` + `empresa` repetidos — o mesmo anúncio republicado sob IDs diferentes, observado no portal. A segunda chave só vale quando a empresa foi identificada, senão vagas homônimas de empresas distintas colapsariam numa só. A função é única para os dois caminhos de gravação (com e sem `pandas`), que antes usavam critérios diferentes e geravam arquivos distintos.
 
-**Campos ausentes.** Toda extração passa pela função `limpar()`, que devolve `"Nao informado"` quando o valor é `None` ou string vazia, normaliza espaços e trunca textos longos (requisitos e descrição são limitados a 3.000 caracteres, cortando na última palavra inteira).
+**Campos ausentes.** Toda extração passa por `limpar()`, que normaliza espaços, trunca textos longos (3.000 caracteres, cortando na última palavra) e devolve `"Nao informado"` quando o valor é vazio. O caso mais frequente não é o campo vazio: o portal escreve `Salário: Não especificado`, string não vazia que era gravada como faixa válida — a estatística acusava zero vagas sem salário, quando eram quase 70%. `limpar_opcional()` converte esses rótulos ("Não especificado", "A combinar", "-") em `"Nao informado"`; só então a cascata funciona: rótulo "Salário:" → valor em R$ no anúncio → `"Nao informado"`. `normalizar_nivel()` e `normalizar_contrato()` removem acentos e caixa, evitando que `Sênior`, `Senior` e `SENIOR` virem categorias distintas.
 
-Há, porém, um caso que `limpar()` sozinha não resolve e que é o mais frequente neste portal: o campo **não** vem vazio — vem preenchido com um rótulo que significa "ausente". O ProgramaThor escreve literalmente `Salário: Não especificado`. Como essa é uma string não vazia, ela era capturada como se fosse uma faixa salarial válida; a consequência é que o *fallback* para valores em R$ nunca era acionado e a estatística de campos ausentes acusava **zero** vagas sem salário, quando na verdade eram quase 70% delas. Introduziu-se por isso a função `limpar_opcional()`, que compara o valor já normalizado com um conjunto de rótulos de ausência (`SEM_INFORMACAO`: "Não especificado", "A combinar", "-"…) e o converte em `"Nao informado"`. Só então a cascata do salário funciona como descrito: rótulo "Salário:" → valor em R$ no corpo do anúncio → `"Nao informado"`.
+**Exceções.** `baixar_pagina()` encapsula erros de rede, respeita o `timeout`, repete até 3 vezes e devolve `None` em vez de propagar a falha; o laço pula a vaga. `extrair_vaga()` envolve o *parsing* em `try/except` e o Selenium usa `try/except/finally`, garantindo `driver.quit()`. Uma página fora do ar não interrompe a coleta.
 
-**Normalização do nível.** O regex do método 13 usa `IGNORECASE` e devolve o texto exatamente como aparece na página, o que produzia `Sênior`, `Senior` e `PLENO` como categorias distintas — inúteis como chave de agrupamento. A função `normalizar_nivel()` remove acentos, aplica minúsculas e mapeia o resultado para uma forma canônica (`Junior`, `Pleno`, `Senior`, `Trainee`, `Estagio`).
-
-Quando nenhuma seção nomeada é reconhecida na página, a descrição recebe o texto útil da página como último recurso, de modo que a coluna nunca fica vazia.
-
-**Exceções.** `baixar_pagina()` encapsula todos os erros de rede (`requests.exceptions.RequestException`), respeita o `timeout`, repete até 3 vezes com espera progressiva e devolve `None` em vez de propagar a falha. O laço principal simplesmente pula a vaga cujo download falhou. `extrair_vaga()` envolve todo o *parsing* em `try/except`, registrando o erro no log e seguindo adiante. A rotina do Selenium tem `try/except/finally`, garantindo `driver.quit()` mesmo em caso de erro, e cai no modo sem navegador se algo der errado. O resultado é que uma página malformada ou fora do ar não interrompe a coleta.
-
-## 6. Resultados e limitações
-
-Foram percorridas **3 páginas de resultados** — `/jobs-python`, `?page=2` e `?page=3` —, gerando um arquivo final com as colunas: `titulo`, `empresa`, `local`, `faixa_salarial`, `tipo_contrato`, `nivel`, `tecnologias`, `requisitos`, `descricao`, `link`, `pagina_origem`, `data_coleta`.
-
-Números da execução final:
+## 6. Resultados
 
 | Indicador | Valor |
 |---|---|
-| Regras `Disallow` lidas no `robots.txt` | 4 (`/admin/`, `/user/`, `/users/`, `/company/`) |
-| URLs listadas no sitemap | 30.382 (30.364 contendo `/jobs`) |
-| `can_fetch('/jobs')` | `True` |
-| Links de vaga únicos coletados nas 3 páginas | 44 (15 + 15 + 14) |
-| Páginas de vaga que retornaram HTTP 500 no portal | 2 (puladas sem interromper a coleta) |
-| Registros extraídos | 42 |
-| Registros após deduplicação | 42 (nenhuma duplicata nesta execução) |
-| Empresas distintas | 29 |
-| Vagas **sem** faixa salarial divulgada | 29 de 42 (69%) |
-| Vagas sem empresa identificada | 5 de 42 (anúncios sem perfil corporativo vinculado) |
-| Distribuição por nível | Senior 20 · Pleno 19 · Junior 3 |
-| Distribuição por contrato | PJ 26 · CLT 16 |
+| Regras `Disallow` lidas / `can_fetch('/jobs')` | 4 / `True` |
+| URLs no sitemap | 30.382 (30.364 contendo `/jobs`) |
+| Links únicos coletados nas 3 páginas | 44 (15 + 15 + 14) |
+| Páginas de vaga com HTTP 500 no portal | 2 (puladas sem interromper a coleta) |
+| Registros finais após deduplicação | 42 (13 da pág. 1, 15 da pág. 2, 14 da pág. 3) |
+| Empresas distintas / vagas sem empresa ou local | 30 / 0 |
+| Vagas sem faixa salarial divulgada | 29 de 42 (69%) |
+| Nível / contrato | Senior 20 · Pleno 19 · Junior 3 / PJ 26 · CLT 16 |
 
-As 42 vagas têm Python entre as tecnologias, o que confirma que a busca da Etapa 2 e a paginação da Etapa 3 permaneceram dentro do recorte pretendido. A deduplicação não removeu nada nesta execução; sua utilidade ficou demonstrada numa execução anterior, em que o portal exibia o mesmo anúncio sob dois IDs (`/jobs/33756-…` e `/jobs/33760-engenheiro-de-automacao-ia-senior`).
+As 42 vagas têm Python na coluna `tecnologias`, confirmando que busca e paginação ficaram no recorte pretendido. A limitação principal é a dependência do HTML — por isso preferiram-se âncoras estáveis (padrão de URL, rótulos de texto, tags semânticas) a classes CSS. A faixa salarial ausente não pode ser inferida: análises de remuneração se apoiam em 13 observações.
 
-A principal limitação é a dependência da estrutura do HTML: mudanças de layout do portal exigem revisão dos seletores. Por isso optou-se, sempre que possível, por âncoras estáveis — padrão de URL, rótulos de texto ("Salário:", "Requisitos") e tags semânticas (`h1`) — em vez de nomes de classe CSS, que costumam ser gerados automaticamente e mudam com frequência. Outra limitação é que a faixa salarial, quando ausente no anúncio, não pode ser inferida: com 29 das 42 vagas sem esse dado, qualquer análise estatística sobre remuneração se apoia em apenas 13 observações. Por fim, o campo `tipo_contrato` é obtido pela primeira ocorrência de "CLT"/"PJ" no texto da página; embora o portal exiba esse dado num bloco fixo logo abaixo do nome da empresa — o que torna a primeira ocorrência confiável na prática —, trata-se de uma âncora posicional, não semântica, e portanto mais frágil que as demais.
+## 7. Declaração de uso de IA
+
+Foi utilizada a ferramenta **Claude (Anthropic), via Claude Code**, nas seguintes tarefas:
+
+| Tarefa | Uso |
+|---|---|
+| Desenvolvimento do código | apoio na escrita e refatoração das funções de coleta, extração, limpeza e gravação |
+| Revisão de código | identificação e correção de falhas: checagem do `robots.txt` antes do acesso via Selenium, casamento de texto na delimitação do cabeçalho e limite no fallback do nome da empresa |
+| Redação do relatório | organização, redação e revisão deste documento |
+| Organização do projeto | correção da estrutura do repositório git |
+
+A escolha do portal e do recorte, a execução das coletas e a conferência dos dados gerados foram feitas pelo autor.
