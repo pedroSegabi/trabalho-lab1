@@ -515,7 +515,11 @@ def texto_cabecalho(soup, texto_vaga):
     com o valor de outra parte da pagina.
     """
     h1 = soup.select_one("h1")
-    inicio = texto_vaga.rfind(h1.get_text(" ", strip=True)) if h1 else -1
+    # Mesmo separador usado em texto_da_vaga() (soup.get_text("\n", ...)):
+    # com " " aqui, um <h1> com varios nos de texto (ex.: <span>s) gera uma
+    # string que nao bate com o "\n"-joined texto_vaga, o rfind falha (-1) e
+    # o cabecalho passa a comecar do topo da pagina (menu/nav incluidos).
+    inicio = texto_vaga.rfind(h1.get_text("\n", strip=True)) if h1 else -1
     inicio = max(inicio, 0)
     fim = len(texto_vaga)
     for cabecalho in soup.find_all("h3"):
@@ -659,10 +663,14 @@ def extrair_vaga(url, pagina_origem):
             break
 
         # Empresas sem perfil publico no portal nao tem essa ancora nenhuma;
-        # nesses anuncios o nome esta no <h2> logo apos o <h1>.
+        # nesses anuncios o nome esta no <h2> logo apos o <h1>. Exige que esse
+        # <h2> venha antes do primeiro <h3> (mesmo limite do bloco de
+        # cabecalho): sem isso, um <h2> qualquer mais abaixo na pagina
+        # ("Compartilhe esta vaga", sidebar) virava o nome da empresa.
         if empresa == CAMPO_VAZIO and h1 is not None:
-            h2 = h1.find_next("h2")
-            empresa = limpar(h2.get_text(" ", strip=True) if h2 else None)
+            proximo_titulo = h1.find_next(["h2", "h3"])
+            if proximo_titulo is not None and proximo_titulo.name == "h2":
+                empresa = limpar(proximo_titulo.get_text(" ", strip=True))
 
         # -- local: rotulo "Localizacao:" no bloco de informacoes da vaga
         m_local = RE_LOCAL.search(cabecalho)
@@ -810,6 +818,11 @@ def main():
     print("=" * 79)
 
     robots = verificar_robots_e_sitemap()
+
+    # O Selenium acessa URL_LISTAGEM (/jobs) de verdade antes de qualquer
+    # outra checagem; sem isto o robots.txt so era conferido para a URL de
+    # resultados, deixando a propria listagem sem protecao (fail-open).
+    garantir_permissao(robots, URL_LISTAGEM)
 
     url_resultados = buscar_com_selenium(TERMO_BUSCA)
     if url_resultados is None:
