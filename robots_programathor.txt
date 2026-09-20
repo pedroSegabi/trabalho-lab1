@@ -1,0 +1,6 @@
+Sitemap: https://programathor.com.br/sitemap.xml
+User-agent: *
+Disallow: /admin/
+Disallow: /user/
+Disallow: /users/
+Disallow: /company/
